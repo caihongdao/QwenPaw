@@ -1,0 +1,95 @@
+name: build-remote-desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (tag/branch/sha)"
+        required: false
+        default: "v2.2.1"
+      backend:
+        description: "Remote QwenPaw backend base URL"
+        required: false
+        default: "http://192.168.12.210:8088"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-remote-desktop
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || 'v2.2.1' }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: console/src-tauri
+
+      - name: Install NSIS
+        uses: negrutiu/nsis-install@v2
+
+      - name: Configure remote backend (env + CSP + resources + updater)
+        shell: pwsh
+        env:
+          BACKEND_URL: ${{ github.event.inputs.backend || 'http://192.168.12.210:8088' }}
+        run: |
+          $backend = $env:BACKEND_URL.TrimEnd('/')
+          $origin = ([uri]$backend).Authority
+          Set-Content -Path console/.env -Value "VITE_API_BASE_URL=$backend"
+          @'
+          const fs = require("fs");
+          const origin = process.argv[2];
+          const p = "console/src-tauri/tauri.conf.json";
+          const c = JSON.parse(fs.readFileSync(p, "utf8"));
+          c.app.security.csp["connect-src"] += ` http://${origin} ws://${origin}`;
+          c.bundle.resources = [];
+          c.plugins.updater.endpoints = ["http://127.0.0.1:9/disabled.json"];
+          fs.writeFileSync(p, JSON.stringify(c, null, 2));
+          console.log("connect-src =", c.app.security.csp["connect-src"]);
+          console.log("resources =", JSON.stringify(c.bundle.resources));
+          '@ | Set-Content -Path patch-remote.cjs
+          node patch-remote.cjs $origin
+          Get-Content console/.env
+
+      - name: Build bootstrap + Tauri app
+        shell: pwsh
+        env:
+          BACKEND_URL: ${{ github.event.inputs.backend || 'http://192.168.12.210:8088' }}
+          VITE_API_BASE_URL: ${{ github.event.inputs.backend || 'http://192.168.12.210:8088' }}
+        run: |
+          $env:VITE_API_BASE_URL = $env:BACKEND_URL.TrimEnd('/')
+          cd console
+          npm ci
+          npm exec -- tauri icon ../scripts/pack/assets/icon.svg
+          node ../scripts/pack-tauri/sync_tauri_version.mjs
+          npm exec -- tauri build --config src-tauri/tauri.version.conf.json
+
+      - name: List bundles
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse console/src-tauri/target/release/bundle -File |
+            Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwenpaw-remote-desktop-${{ github.run_id }}
+          path: console/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
